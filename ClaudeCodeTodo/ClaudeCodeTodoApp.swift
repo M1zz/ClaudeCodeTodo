@@ -49,18 +49,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func showMenu() {
         let menu = NSMenu()
-        
-        // 태스크 요약
-        let pendingCount = todoManager.todos.filter { $0.status == .pending }.count
-        let inProgressCount = todoManager.todos.filter { $0.status == .inProgress }.count
-        let completedCount = todoManager.todos.filter { $0.status == .completed }.count
-        
-        let summaryItem = NSMenuItem(title: "📋 \(pendingCount) pending · \(inProgressCount) active · \(completedCount) done", action: nil, keyEquivalent: "")
-        summaryItem.isEnabled = false
-        menu.addItem(summaryItem)
-        
+
+        // 태스크 요약 (멀티 프로젝트 모드)
+        if !todoManager.projects.isEmpty {
+            let allTodos = todoManager.projects.flatMap { $0.todos }
+            let pendingCount = allTodos.filter { $0.status == .pending }.count
+            let inProgressCount = allTodos.filter { $0.status == .inProgress }.count
+            let completedCount = allTodos.filter { $0.status == .completed }.count
+
+            let summaryItem = NSMenuItem(title: "📋 \(pendingCount) pending · \(inProgressCount) active · \(completedCount) done", action: nil, keyEquivalent: "")
+            summaryItem.isEnabled = false
+            menu.addItem(summaryItem)
+
+            let projectsItem = NSMenuItem(title: "📁 \(todoManager.projects.count) projects", action: nil, keyEquivalent: "")
+            projectsItem.isEnabled = false
+            menu.addItem(projectsItem)
+        } else {
+            let pendingCount = todoManager.todos.filter { $0.status == .pending }.count
+            let inProgressCount = todoManager.todos.filter { $0.status == .inProgress }.count
+            let completedCount = todoManager.todos.filter { $0.status == .completed }.count
+
+            let summaryItem = NSMenuItem(title: "📋 \(pendingCount) pending · \(inProgressCount) active · \(completedCount) done", action: nil, keyEquivalent: "")
+            summaryItem.isEnabled = false
+            menu.addItem(summaryItem)
+        }
+
         menu.addItem(NSMenuItem.separator())
-        
+
         // 윈도우 토글
         let windowItem = NSMenuItem(
             title: floatingWindow?.isVisible == true ? "Hide Window" : "Show Window",
@@ -68,32 +83,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "t"
         )
         menu.addItem(windowItem)
-        
+
         // 새로고침
         menu.addItem(NSMenuItem(title: "Refresh", action: #selector(refreshTodos), keyEquivalent: "r"))
-        
+
+        // 재스캔
+        menu.addItem(NSMenuItem(title: "Rescan Projects", action: #selector(rescanProjects), keyEquivalent: ""))
+
         menu.addItem(NSMenuItem.separator())
-        
+
         // 파일 선택
         menu.addItem(NSMenuItem(title: "Select todo.md...", action: #selector(selectFile), keyEquivalent: "o"))
-        
-        // 현재 감시 중인 파일
-        if !todoManager.watchedPath.isEmpty {
+
+        // 현재 감시 중인 파일/폴더
+        if !todoManager.projects.isEmpty {
+            let pathItem = NSMenuItem(title: "📁 ~/Documents/code", action: nil, keyEquivalent: "")
+            pathItem.isEnabled = false
+            menu.addItem(pathItem)
+        } else if !todoManager.watchedPath.isEmpty {
             let pathItem = NSMenuItem(title: "📁 \(shortenPath(todoManager.watchedPath))", action: nil, keyEquivalent: "")
             pathItem.isEnabled = false
             menu.addItem(pathItem)
         }
-        
+
         menu.addItem(NSMenuItem.separator())
-        
+
         // 설정
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ","))
-        
+
         menu.addItem(NSMenuItem.separator())
-        
+
         // 종료
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q"))
-        
+
         statusItem?.menu = menu
         statusItem?.button?.performClick(nil)
         statusItem?.menu = nil
@@ -150,6 +172,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     @objc func refreshTodos() {
         todoManager.refresh()
+    }
+
+    @objc func rescanProjects() {
+        todoManager.rescan()
     }
     
     @objc func selectFile() {

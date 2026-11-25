@@ -9,12 +9,12 @@ struct TodoItem: Identifiable, Equatable {
     let status: TodoStatus
     let priority: Priority
     let originalLine: String
-    
+
     enum TodoStatus: String {
         case pending = "pending"
         case inProgress = "in_progress"
         case completed = "completed"
-        
+
         var icon: String {
             switch self {
             case .pending: return "circle"
@@ -23,16 +23,16 @@ struct TodoItem: Identifiable, Equatable {
             }
         }
     }
-    
+
     enum Priority: Int, Comparable {
         case high = 0
         case medium = 1
         case low = 2
-        
+
         static func < (lhs: Priority, rhs: Priority) -> Bool {
             lhs.rawValue < rhs.rawValue
         }
-        
+
         var label: String {
             switch self {
             case .high: return "HIGH"
@@ -43,43 +43,162 @@ struct TodoItem: Identifiable, Equatable {
     }
 }
 
+// MARK: - Project Model
+struct ProjectTodos: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let path: String
+    var todos: [TodoItem]
+    var lastModified: Date?
+
+    var completedCount: Int {
+        todos.filter { $0.status == .completed }.count
+    }
+
+    var totalCount: Int {
+        todos.count
+    }
+
+    var progress: Double {
+        totalCount > 0 ? Double(completedCount) / Double(totalCount) : 0
+    }
+}
+
 // MARK: - Todo Manager
 class TodoManager: ObservableObject {
     static let shared = TodoManager()
-    
-    @Published var todos: [TodoItem] = []
+
+    @Published var projects: [ProjectTodos] = []
+    @Published var todos: [TodoItem] = [] // 단일 파일 모드용 (하위 호환)
     @Published var lastUpdated: Date?
     @Published var isWatching: Bool = false
     @Published var watchedPath: String = ""
     @Published var error: String?
-    
-    private var fileMonitor: DispatchSourceFileSystemObject?
-    private var directoryMonitor: DispatchSourceFileSystemObject?
-    private var currentFileDescriptor: Int32 = -1
-    private var currentDirDescriptor: Int32 = -1
+    @Published var collapsedProjects: Set<String> = []
+
+    private var fileMonitors: [String: DispatchSourceFileSystemObject] = [:]
+    private var directoryMonitors: [String: DispatchSourceFileSystemObject] = [:]
+    private var fileDescriptors: [String: Int32] = [:]
+    private var dirDescriptors: [String: Int32] = [:]
     private var pollingTimer: Timer?
-    
+    private var baseDirectoryMonitor: DispatchSourceFileSystemObject?
+    private var baseDirDescriptor: Int32 = -1
+
     @AppStorage("todoFilePath") var savedPath: String = ""
     @AppStorage("autoDetect") var autoDetect: Bool = true
-    
+    @AppStorage("scanBasePath") var scanBasePath: String = ""
+
     private init() {
+        loadCollapsedState()
         if autoDetect {
-            detectTodoFile()
+            detectAllTodoFiles()
         } else if !savedPath.isEmpty {
             startWatching(path: savedPath)
         }
-        
+
         // 폴링 타이머 시작 (백업용)
         startPolling()
     }
+
+    // MARK: - Collapsed State
+    private func loadCollapsedState() {
+        // 이전 데이터 형식 문제 방지를 위해 새 키 사용
+        guard let data = UserDefaults.standard.data(forKey: "collapsedProjectsV2") else {
+            // 기존 키 삭제 (타입 불일치 방지)
+            UserDefaults.standard.removeObject(forKey: "collapsedProjects")
+            return
+        }
+        do {
+            let decoded = try JSONDecoder().decode(Set<String>.self, from: data)
+            collapsedProjects = decoded
+        } catch {
+            print("Failed to load collapsed state: \(error)")
+            UserDefaults.standard.removeObject(forKey: "collapsedProjectsV2")
+        }
+    }
+
+    private func saveCollapsedState() {
+        do {
+            let data = try JSONEncoder().encode(collapsedProjects)
+            UserDefaults.standard.set(data, forKey: "collapsedProjectsV2")
+        } catch {
+            print("Failed to save collapsed state: \(error)")
+        }
+    }
+
+    func toggleCollapsed(projectId: String) {
+        if collapsedProjects.contains(projectId) {
+            collapsedProjects.remove(projectId)
+        } else {
+            collapsedProjects.insert(projectId)
+        }
+        saveCollapsedState()
+    }
+
+    func isCollapsed(projectId: String) -> Bool {
+        collapsedProjects.contains(projectId)
+    }
     
-    // MARK: - Auto Detection
+    // MARK: - Auto Detection (Multiple Projects)
+    func detectAllTodoFiles() {
+        let fileManager = FileManager.default
+        var foundPaths: [(path: String, projectName: String, modDate: Date)] = []
+
+        // 기본 검색 경로: ~/Documents/code 또는 사용자 지정 경로
+        let basePath: String
+        if !scanBasePath.isEmpty {
+            basePath = NSString(string: scanBasePath).expandingTildeInPath
+        } else {
+            basePath = NSHomeDirectory() + "/Documents/code"
+        }
+
+        let baseURL = URL(fileURLWithPath: basePath)
+
+        guard fileManager.fileExists(atPath: basePath) else {
+            // 폴백: 기존 단일 파일 모드
+            detectTodoFile()
+            return
+        }
+
+        // 프로젝트 폴더들 스캔 (1단계 깊이만)
+        if let contents = try? fileManager.contentsOfDirectory(
+            at: baseURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for folderURL in contents {
+                var isDir: ObjCBool = false
+                guard fileManager.fileExists(atPath: folderURL.path, isDirectory: &isDir),
+                      isDir.boolValue else { continue }
+
+                let todoPath = folderURL.appendingPathComponent("todo.md").path
+                if fileManager.fileExists(atPath: todoPath) {
+                    let projectName = folderURL.lastPathComponent
+                    let modDate = (try? fileManager.attributesOfItem(atPath: todoPath)[.modificationDate] as? Date) ?? Date.distantPast
+                    foundPaths.append((todoPath, projectName, modDate))
+                }
+            }
+        }
+
+        if foundPaths.isEmpty {
+            // 폴백: 기존 단일 파일 모드
+            detectTodoFile()
+            return
+        }
+
+        // 수정일 기준 정렬 (최신순)
+        foundPaths.sort { $0.modDate > $1.modDate }
+
+        // 모든 프로젝트 감시 시작
+        startWatchingMultiple(paths: foundPaths)
+    }
+
+    // 기존 단일 파일 감지 (폴백용)
     func detectTodoFile() {
         let fileManager = FileManager.default
         var foundPath: String?
         var latestDate: Date?
-        
-        // 일반적인 경로들
+
         let searchPaths = [
             NSHomeDirectory(),
             NSHomeDirectory() + "/Desktop",
@@ -87,7 +206,7 @@ class TodoManager: ObservableObject {
             NSHomeDirectory() + "/Developer",
             FileManager.default.currentDirectoryPath
         ]
-        
+
         for basePath in searchPaths {
             let todoPath = basePath + "/todo.md"
             if fileManager.fileExists(atPath: todoPath) {
@@ -100,176 +219,428 @@ class TodoManager: ObservableObject {
                 }
             }
         }
-        
-        // 홈 디렉토리 하위 검색 (깊이 제한)
-        let homeURL = URL(fileURLWithPath: NSHomeDirectory())
-        if let enumerator = fileManager.enumerator(
-            at: homeURL,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) {
-            for case let fileURL as URL in enumerator {
-                // 깊이 제한
-                if fileURL.pathComponents.count > homeURL.pathComponents.count + 4 {
-                    enumerator.skipDescendants()
-                    continue
-                }
-                
-                // node_modules, .git 등 제외
-                let skipDirs = ["node_modules", ".git", "Library", "Applications", ".Trash"]
-                if skipDirs.contains(fileURL.lastPathComponent) {
-                    enumerator.skipDescendants()
-                    continue
-                }
-                
-                if fileURL.lastPathComponent == "todo.md" {
-                    if let attrs = try? fileManager.attributesOfItem(atPath: fileURL.path),
-                       let modDate = attrs[.modificationDate] as? Date {
-                        if latestDate == nil || modDate > latestDate! {
-                            latestDate = modDate
-                            foundPath = fileURL.path
-                        }
-                    }
-                }
-            }
-        }
-        
+
         if let path = foundPath {
             startWatching(path: path)
         }
     }
     
-    // MARK: - File Watching
+    // MARK: - File Watching (Multiple Projects)
+    func startWatchingMultiple(paths: [(path: String, projectName: String, modDate: Date)]) {
+        stopWatching()
+
+        var newProjects: [ProjectTodos] = []
+
+        for item in paths {
+            let projectId = item.projectName
+            let project = ProjectTodos(
+                id: projectId,
+                name: item.projectName,
+                path: item.path,
+                todos: [],
+                lastModified: item.modDate
+            )
+            newProjects.append(project)
+
+            // 파일 감시 시작
+            watchFileForProject(at: item.path, projectId: projectId)
+
+            // 디렉토리 감시
+            let directory = (item.path as NSString).deletingLastPathComponent
+            watchDirectoryForProject(at: directory, projectId: projectId, filePath: item.path)
+        }
+
+        // 베이스 폴더 감시 (새 프로젝트 감지)
+        let basePath: String
+        if !scanBasePath.isEmpty {
+            basePath = NSString(string: scanBasePath).expandingTildeInPath
+        } else {
+            basePath = NSHomeDirectory() + "/Documents/code"
+        }
+        watchBaseDirectory(at: basePath)
+
+        DispatchQueue.main.async {
+            self.projects = newProjects
+            self.isWatching = true
+            self.error = nil
+
+            // 모든 파일 파싱
+            for project in newProjects {
+                self.parseFileForProject(at: project.path, projectId: project.id)
+            }
+        }
+    }
+
+    // 베이스 폴더 감시 (새 프로젝트/todo.md 감지)
+    private func watchBaseDirectory(at path: String) {
+        let work = { [weak self] in
+            guard let self = self else { return }
+
+            if self.baseDirDescriptor != -1 {
+                close(self.baseDirDescriptor)
+                self.baseDirDescriptor = -1
+            }
+            self.baseDirectoryMonitor?.cancel()
+            self.baseDirectoryMonitor = nil
+
+            let fd = open(path, O_EVTONLY)
+            guard fd != -1 else {
+                print("Failed to open base directory: \(path)")
+                return
+            }
+            self.baseDirDescriptor = fd
+
+            let queue = DispatchQueue.global(qos: .utility)
+            let monitor = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd,
+                eventMask: [.write, .link],
+                queue: queue
+            )
+
+            monitor.setEventHandler { [weak self] in
+                // 새 폴더나 파일이 생기면 재스캔
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    self?.checkForNewProjects()
+                }
+            }
+
+            monitor.setCancelHandler {
+                close(fd)
+            }
+
+            monitor.resume()
+            self.baseDirectoryMonitor = monitor
+        }
+
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
+    }
+
+    // 새 프로젝트 확인
+    private func checkForNewProjects() {
+        let fileManager = FileManager.default
+        let basePath: String
+        if !scanBasePath.isEmpty {
+            basePath = NSString(string: scanBasePath).expandingTildeInPath
+        } else {
+            basePath = NSHomeDirectory() + "/Documents/code"
+        }
+
+        let baseURL = URL(fileURLWithPath: basePath)
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: baseURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        var hasNewProject = false
+
+        for folderURL in contents {
+            var isDir: ObjCBool = false
+            guard fileManager.fileExists(atPath: folderURL.path, isDirectory: &isDir),
+                  isDir.boolValue else { continue }
+
+            let todoPath = folderURL.appendingPathComponent("todo.md").path
+            let projectName = folderURL.lastPathComponent
+
+            // 이미 감시 중인 프로젝트인지 확인
+            let isExisting = projects.contains { $0.id == projectName }
+
+            if fileManager.fileExists(atPath: todoPath) && !isExisting {
+                // 새 프로젝트 발견
+                hasNewProject = true
+                let modDate = (try? fileManager.attributesOfItem(atPath: todoPath)[.modificationDate] as? Date) ?? Date()
+
+                let newProject = ProjectTodos(
+                    id: projectName,
+                    name: projectName,
+                    path: todoPath,
+                    todos: [],
+                    lastModified: modDate
+                )
+
+                DispatchQueue.main.async {
+                    self.projects.append(newProject)
+                    self.projects.sort { ($0.lastModified ?? .distantPast) > ($1.lastModified ?? .distantPast) }
+                }
+
+                // 파일 감시 시작
+                watchFileForProject(at: todoPath, projectId: projectName)
+                watchDirectoryForProject(at: folderURL.path, projectId: projectName, filePath: todoPath)
+                parseFileForProject(at: todoPath, projectId: projectName)
+            }
+        }
+
+        if hasNewProject {
+            DispatchQueue.main.async {
+                self.lastUpdated = Date()
+            }
+        }
+    }
+
+    // 단일 파일 모드 (하위 호환)
     func startWatching(path: String) {
         stopWatching()
-        
+
         let expandedPath = NSString(string: path).expandingTildeInPath
         watchedPath = expandedPath
         savedPath = expandedPath
-        
-        // 파일 존재 시 읽기
+
         if FileManager.default.fileExists(atPath: expandedPath) {
             parseFile(at: expandedPath)
-            watchFile(at: expandedPath)
+            watchFileForProject(at: expandedPath, projectId: "_single")
         }
-        
-        // 디렉토리 모니터링
+
         let directory = (expandedPath as NSString).deletingLastPathComponent
-        let filename = (expandedPath as NSString).lastPathComponent
-        watchDirectory(at: directory, forFile: filename)
-        
+        watchDirectoryForProject(at: directory, projectId: "_single", filePath: expandedPath)
+
         isWatching = true
         error = nil
     }
-    
-    private func watchFile(at path: String) {
-        if currentFileDescriptor != -1 {
-            close(currentFileDescriptor)
-        }
-        
-        currentFileDescriptor = open(path, O_EVTONLY)
-        guard currentFileDescriptor != -1 else { return }
-        
-        let queue = DispatchQueue.global(qos: .utility)
-        fileMonitor = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: currentFileDescriptor,
-            eventMask: [.write, .delete, .rename, .extend],
-            queue: queue
-        )
-        
-        fileMonitor?.setEventHandler { [weak self] in
+
+    private func watchFileForProject(at path: String, projectId: String) {
+        // 메인 스레드에서 안전하게 실행
+        let work = { [weak self] in
             guard let self = self else { return }
-            let events = self.fileMonitor?.data ?? []
-            
-            if events.contains(.delete) || events.contains(.rename) {
-                DispatchQueue.main.async {
-                    self.todos = []
+
+            // 기존 모니터 정리
+            if let existingFd = self.fileDescriptors[projectId], existingFd != -1 {
+                close(existingFd)
+                self.fileDescriptors[projectId] = nil
+            }
+            self.fileMonitors[projectId]?.cancel()
+            self.fileMonitors[projectId] = nil
+
+            // 파일 열기
+            let fd = open(path, O_EVTONLY)
+            guard fd != -1 else {
+                print("Failed to open file: \(path)")
+                return
+            }
+            self.fileDescriptors[projectId] = fd
+
+            let queue = DispatchQueue.global(qos: .utility)
+            let monitor = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd,
+                eventMask: [.write, .delete, .rename, .extend],
+                queue: queue
+            )
+
+            monitor.setEventHandler { [weak self] in
+                guard let self = self else { return }
+                let events = monitor.data
+
+                if events.contains(.delete) || events.contains(.rename) {
+                    DispatchQueue.main.async {
+                        if let index = self.projects.firstIndex(where: { $0.id == projectId }) {
+                            self.projects[index].todos = []
+                        }
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        if FileManager.default.fileExists(atPath: path) {
+                            self.watchFileForProject(at: path, projectId: projectId)
+                            self.parseFileForProject(at: path, projectId: projectId)
+                        }
+                    }
+                } else {
+                    self.parseFileForProject(at: path, projectId: projectId)
                 }
-                // 파일 재생성 대기
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    if FileManager.default.fileExists(atPath: path) {
-                        self.watchFile(at: path)
-                        self.parseFile(at: path)
+            }
+
+            monitor.setCancelHandler {
+                close(fd)
+            }
+
+            monitor.resume()
+            self.fileMonitors[projectId] = monitor
+        }
+
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
+    }
+
+    private func watchDirectoryForProject(at path: String, projectId: String, filePath: String) {
+        let work = { [weak self] in
+            guard let self = self else { return }
+
+            // 기존 모니터 정리
+            if let existingFd = self.dirDescriptors[projectId], existingFd != -1 {
+                close(existingFd)
+                self.dirDescriptors[projectId] = nil
+            }
+            self.directoryMonitors[projectId]?.cancel()
+            self.directoryMonitors[projectId] = nil
+
+            let fd = open(path, O_EVTONLY)
+            guard fd != -1 else {
+                print("Failed to open directory: \(path)")
+                return
+            }
+            self.dirDescriptors[projectId] = fd
+
+            let queue = DispatchQueue.global(qos: .utility)
+            let monitor = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd,
+                eventMask: .write,
+                queue: queue
+            )
+
+            monitor.setEventHandler { [weak self] in
+                if FileManager.default.fileExists(atPath: filePath) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        self?.parseFileForProject(at: filePath, projectId: projectId)
+                        self?.watchFileForProject(at: filePath, projectId: projectId)
                     }
                 }
-            } else {
-                self.parseFile(at: path)
             }
-        }
-        
-        fileMonitor?.setCancelHandler { [weak self] in
-            if let fd = self?.currentFileDescriptor, fd != -1 {
+
+            monitor.setCancelHandler {
                 close(fd)
-                self?.currentFileDescriptor = -1
             }
+
+            monitor.resume()
+            self.directoryMonitors[projectId] = monitor
         }
-        
-        fileMonitor?.resume()
+
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
     }
-    
-    private func watchDirectory(at path: String, forFile filename: String) {
-        currentDirDescriptor = open(path, O_EVTONLY)
-        guard currentDirDescriptor != -1 else { return }
-        
-        let queue = DispatchQueue.global(qos: .utility)
-        directoryMonitor = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: currentDirDescriptor,
-            eventMask: .write,
-            queue: queue
-        )
-        
-        let fullPath = (path as NSString).appendingPathComponent(filename)
-        
-        directoryMonitor?.setEventHandler { [weak self] in
-            if FileManager.default.fileExists(atPath: fullPath) {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    self?.parseFile(at: fullPath)
-                    self?.watchFile(at: fullPath)
-                }
-            }
-        }
-        
-        directoryMonitor?.setCancelHandler { [weak self] in
-            if let fd = self?.currentDirDescriptor, fd != -1 {
-                close(fd)
-                self?.currentDirDescriptor = -1
-            }
-        }
-        
-        directoryMonitor?.resume()
-    }
-    
+
     private func startPolling() {
         pollingTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            guard let self = self, !self.watchedPath.isEmpty else { return }
-            self.parseFile(at: self.watchedPath)
+            guard let self = self else { return }
+
+            // 멀티 프로젝트 모드
+            if !self.projects.isEmpty {
+                for project in self.projects {
+                    self.parseFileForProject(at: project.path, projectId: project.id)
+                }
+            }
+            // 단일 파일 모드
+            else if !self.watchedPath.isEmpty {
+                self.parseFile(at: self.watchedPath)
+            }
         }
     }
-    
+
     func stopWatching() {
-        fileMonitor?.cancel()
-        directoryMonitor?.cancel()
-        fileMonitor = nil
-        directoryMonitor = nil
+        for (_, monitor) in fileMonitors {
+            monitor.cancel()
+        }
+        for (_, monitor) in directoryMonitors {
+            monitor.cancel()
+        }
+        baseDirectoryMonitor?.cancel()
+        baseDirectoryMonitor = nil
+        if baseDirDescriptor != -1 {
+            close(baseDirDescriptor)
+            baseDirDescriptor = -1
+        }
+        fileMonitors.removeAll()
+        directoryMonitors.removeAll()
+        fileDescriptors.removeAll()
+        dirDescriptors.removeAll()
         isWatching = false
     }
-    
+
     func refresh() {
-        if !watchedPath.isEmpty {
+        if !projects.isEmpty {
+            for project in projects {
+                parseFileForProject(at: project.path, projectId: project.id)
+            }
+        } else if !watchedPath.isEmpty {
             parseFile(at: watchedPath)
         } else if autoDetect {
-            detectTodoFile()
+            detectAllTodoFiles()
+        }
+    }
+
+    func rescan() {
+        stopWatching()
+        projects = []
+        todos = []
+        detectAllTodoFiles()
+    }
+
+    // MARK: - Toggle Todo Status
+    func toggleTodoStatus(todo: TodoItem, inFile path: String) {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+
+        do {
+            let content = try String(contentsOfFile: path, encoding: .utf8)
+            var lines = content.components(separatedBy: "\n")
+
+            // 원본 라인 찾기
+            if let index = lines.firstIndex(where: { $0 == todo.originalLine }) {
+                var line = lines[index]
+
+                // 체크박스 토글
+                if line.contains("- [ ]") {
+                    line = line.replacingOccurrences(of: "- [ ]", with: "- [x]")
+                } else if line.contains("- [x]") || line.contains("- [X]") {
+                    line = line.replacingOccurrences(of: "- [x]", with: "- [ ]")
+                    line = line.replacingOccurrences(of: "- [X]", with: "- [ ]")
+                } else if line.contains("* [ ]") {
+                    line = line.replacingOccurrences(of: "* [ ]", with: "* [x]")
+                } else if line.contains("* [x]") || line.contains("* [X]") {
+                    line = line.replacingOccurrences(of: "* [x]", with: "* [ ]")
+                    line = line.replacingOccurrences(of: "* [X]", with: "* [ ]")
+                }
+
+                lines[index] = line
+
+                // 파일에 저장
+                let newContent = lines.joined(separator: "\n")
+                try newContent.write(toFile: path, atomically: true, encoding: .utf8)
+            }
+        } catch {
+            DispatchQueue.main.async {
+                self.error = "Failed to toggle: \(error.localizedDescription)"
+            }
         }
     }
     
     // MARK: - Parsing
-    private func parseFile(at path: String) {
+    private func parseFileForProject(at path: String, projectId: String) {
         guard FileManager.default.fileExists(atPath: path) else { return }
-        
+
         do {
             let content = try String(contentsOfFile: path, encoding: .utf8)
             let parsed = parseTodoContent(content)
-            
+
+            DispatchQueue.main.async {
+                if let index = self.projects.firstIndex(where: { $0.id == projectId }) {
+                    if self.projects[index].todos != parsed {
+                        self.projects[index].todos = parsed
+                        self.projects[index].lastModified = Date()
+                        self.lastUpdated = Date()
+                    }
+                }
+            }
+        } catch {
+            DispatchQueue.main.async {
+                self.error = "Failed to read \(projectId): \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // 단일 파일 모드용 (하위 호환)
+    private func parseFile(at path: String) {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+
+        do {
+            let content = try String(contentsOfFile: path, encoding: .utf8)
+            let parsed = parseTodoContent(content)
+
             DispatchQueue.main.async {
                 if self.todos != parsed {
                     self.todos = parsed
@@ -295,7 +666,7 @@ class TodoManager: ObservableObject {
             var priority: TodoItem.Priority = .medium
             var taskContent = trimmed
             
-            // 체크박스 파싱: - [ ], - [x], - [~], - [/]
+            // 체크박스 파싱: - [ ], - [x], - [~], - [/] (체크박스 있는 항목만)
             if trimmed.hasPrefix("- [ ]") || trimmed.hasPrefix("* [ ]") {
                 status = .pending
                 taskContent = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
@@ -307,16 +678,11 @@ class TodoManager: ObservableObject {
                       trimmed.hasPrefix("* [~]") || trimmed.hasPrefix("* [/]") {
                 status = .inProgress
                 taskContent = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            } else if trimmed.hasPrefix("- ") {
-                taskContent = String(trimmed.dropFirst(2))
-            } else if trimmed.hasPrefix("* ") {
-                taskContent = String(trimmed.dropFirst(2))
-            } else if let match = trimmed.range(of: #"^\d+\.\s+"#, options: .regularExpression) {
-                taskContent = String(trimmed[match.upperBound...])
             } else {
+                // 체크박스 없는 항목은 무시 (하위 설명, 일반 리스트 등)
                 continue
             }
-            
+
             // 우선순위 파싱
             let priorityPatterns: [(pattern: String, priority: TodoItem.Priority)] = [
                 ("[HIGH]", .high), ("[high]", .high), ("🔴", .high), ("!!!", .high), ("❗️", .high),
@@ -348,7 +714,7 @@ class TodoManager: ObservableObject {
             }
             
             taskContent = taskContent.trimmingCharacters(in: .whitespaces)
-            
+
             if !taskContent.isEmpty {
                 items.append(TodoItem(
                     content: taskContent,
@@ -358,17 +724,8 @@ class TodoManager: ObservableObject {
                 ))
             }
         }
-        
-        // 정렬: 미완료 → 진행중 → 완료, 같은 상태면 우선순위순
-        return items.sorted { item1, item2 in
-            let statusOrder: [TodoItem.TodoStatus: Int] = [.inProgress: 0, .pending: 1, .completed: 2]
-            let order1 = statusOrder[item1.status] ?? 1
-            let order2 = statusOrder[item2.status] ?? 1
-            
-            if order1 != order2 {
-                return order1 < order2
-            }
-            return item1.priority < item2.priority
-        }
+
+        // 파일에 적힌 순서대로 반환 (정렬 없음)
+        return items
     }
 }

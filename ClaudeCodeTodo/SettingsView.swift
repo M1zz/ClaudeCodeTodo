@@ -29,7 +29,7 @@ struct SettingsView: View {
                 Toggle("Auto-detect todo.md", isOn: $autoDetect)
                     .onChange(of: autoDetect) { newValue in
                         if newValue {
-                            todoManager.detectTodoFile()
+                            todoManager.detectAllTodoFiles()
                         }
                     }
                 
